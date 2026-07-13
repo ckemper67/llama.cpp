@@ -31,8 +31,16 @@ def call(host, n_max, sampling, n_predict, p_min=None):
     req = urllib.request.Request("http://%s/completion" % host,
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=600) as r:
-        resp = json.load(r)
+    resp = None
+    for attempt in range(4):  # some reasoning-format models rarely 500 on the content parser
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                resp = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if attempt == 3:
+                raise
+
     t = resp.get("timings", resp)
     tps       = t.get("predicted_per_second", 0.0)
     pred_n    = t.get("predicted_n", n_predict)
@@ -57,11 +65,11 @@ def main():
 
     scenarios = SCENARIOS if not args.only else {args.only: SCENARIOS[args.only]}
 
-    # warm-up
+    # warm-up (non-fatal: some reasoning-format models 500 on very short generations)
     try:
-        call(args.host, 4, SCENARIOS["greedy"], 16)
+        call(args.host, 4, SCENARIOS["greedy"], args.n_predict)
     except Exception as e:
-        print("server not ready: %s" % e); sys.exit(1)
+        print("warn: warm-up failed (%s); continuing" % e)
 
     pmin_mode = (args.mode == "pmin")
     axis_vals = P_MIN_GRID if pmin_mode else N_MAX_GRID

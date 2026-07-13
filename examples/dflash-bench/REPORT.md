@@ -128,6 +128,41 @@ benefit is marginal - the drafter is not predictive enough.
 - Weak drafter (greedy acceptance < ~50%): fixed `n_max=1-2`; reconsider whether
   a separate drafter beats self-speculation (MTP) or no speculation at all.
 
+## Follow-up: does target quantization explain the weak Gemma drafter?
+
+Tested by swapping the gemma-4-26B-A4B target from standard Q4_K_XL to the
+quantization-aware-trained (QAT) Q4_K_XL variant (same 4-bit size, higher
+fidelity), keeping the same drafter.
+
+- Not corruption: the QAT model produces coherent output via its chat template -
+  it is a reasoning model that emits `<|channel>thought` chains. On a raw
+  `/completion` prompt it drifts into channel tokens, which deterministically
+  tripped the Gemma4 chat-format parser (HTTP 500). Worked around with
+  `--chat-template chatml` (bypasses the PEG_GEMMA4 parser).
+- Greedy acceptance is the clean comparison (deterministic; temp>0 is confounded
+  by the QAT model's reasoning behavior):
+
+  | config | regular Q4 | QAT Q4 |
+  |--------|-----------|--------|
+  | greedy n_max=1 | 38.5% | 48.2% |
+  | greedy n_max=2 | 34.9% | 35.4% |
+  | greedy p_min=0.9 @ n_max=15 | 54.1% | 58.2% |
+
+- QAT lifts greedy acceptance ~5-10 points. Real, and it confirms Gemma is
+  quant-sensitive (the QAT variant exists for exactly this reason; Q4 perturbs
+  the intermediate features DFlash conditions on). But it does NOT close the gap
+  to the Qwen drafters (82-98%) - even with a quant-aware target the Gemma
+  drafter tops out ~48-58%.
+
+Conclusion: target quantization is a minor contributor, not the main cause. The
+dominant limiter is the Gemma DFlash drafter itself (weaker checkpoint;
+Gemma's local/global sliding-window attention is harder to draft for). A better
+drafter, not a better target quant, is what would move the needle.
+
+Caveat: temp>0 comparisons were unreliable (the QAT reasoning model + chatml
+override change the token stream, e.g. real n_max=2 gave an anomalous 5.8%), so
+the greedy numbers are the signal to trust.
+
 ## Recommended models.ini
 
 ```ini

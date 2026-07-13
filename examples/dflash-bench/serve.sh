@@ -34,6 +34,8 @@ COMMON=(
   -kvu
   --ctx-size 16384
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 1.5
+  --reasoning-format none   # avoid content-parser 500s on channel/reasoning tokens
+  ${EXTRA_ARGS:-}
 )
 
 SPEC=()
