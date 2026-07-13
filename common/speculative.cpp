@@ -1160,6 +1160,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            // per-request overrides for the drafting gates (< 0 = use init-time value)
+            const float   p_min_eff = dp.p_min >= 0.0f ? dp.p_min : params.p_min;
+            const int32_t n_min_eff = dp.n_min >= 0    ? dp.n_min : params.n_min;
+
             // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
             for (int32_t i = 1; i < n_block_tokens; ++i) {
                 common_sampler_sample(smpl, ctx_dft, beg + i, true);
@@ -1174,7 +1178,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 const llama_token id = cur_p->data[0].id;
 
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < p_min_eff) {
                     break;
                 }
 
@@ -1183,7 +1187,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.push_back(id);
             }
 
-            if (result.size() < (size_t) params.n_min) {
+            if (result.size() < (size_t) n_min_eff) {
                 result.clear();
             }
         }

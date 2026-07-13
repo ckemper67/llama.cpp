@@ -48,6 +48,10 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // per-request overrides for dflash drafting gates (< 0 = use the init-time value)
+    float   p_min = -1.0f;
+    int32_t n_min = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

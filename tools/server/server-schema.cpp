@@ -194,6 +194,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
+    // per-request draft-tuning overrides (for throughput benchmarking / tuning).
+    // n_max caps the draft below the launch-time --spec-draft-n-max (see get_n_draft_max());
+    // p_min/n_min override the dflash block-truncation gates read in the draft loop.
+    add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Maximum number of tokens to draft during speculative decoding (per-request override)"));
+
+    add((new field_num("speculative.n_min", params.speculative.draft.n_min))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Minimum draft length; shorter drafts are discarded (per-request override)"));
+
+    add((new field_num("speculative.p_min", params.speculative.draft.p_min))
+        ->set_hard_limits(0.0f, 1.0f)
+        ->set_desc("Draft-token probability gate; the block truncates below this (per-request override)"));
+
     // TODO: to keep things simple, we disable speculative parameter adjustments for now
 #if 0
     // TODO: for now, be able to adjust only the draft-model based speculative parameters

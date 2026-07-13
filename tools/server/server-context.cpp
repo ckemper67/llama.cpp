@@ -439,6 +439,11 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
+        // per-request draft-length override (defaults to the launch-time value)
+        if (task->params.speculative.draft.n_max >= 0) {
+            n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -2949,6 +2954,8 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .p_min    = */ slot.task->params.speculative.draft.p_min,
+                            /* .n_min    = */ slot.task->params.speculative.draft.n_min,
                         };
 
                         drafting.push_back(&slot);
