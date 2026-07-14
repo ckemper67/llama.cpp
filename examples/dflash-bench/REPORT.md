@@ -163,9 +163,99 @@ Caveat: temp>0 comparisons were unreliable (the QAT reasoning model + chatml
 override change the token stream, e.g. real n_max=2 gave an anomalous 5.8%), so
 the greedy numbers are the signal to trust.
 
+## Alternative drafters for Gemma (MTP, EAGLE-3, classic)
+
+Since DFlash was weak on Gemma, every other drafter type this build supports was
+tested on the same targets. Best decode t/s and greedy acceptance at n_max=1:
+
+26B-A4B (MoE):
+
+| Drafter | best t/s | accept@1 |
+|---------|----------|----------|
+| DFlash  | ~53 (n=2) | 38% |
+| MTP     | ~45 (n=4) | 69% |
+| EAGLE-3 | ~45 (n=2) | 41% |
+
+31B (dense):
+
+| Drafter | best t/s | accept@1 |
+|---------|----------|----------|
+| DFlash  | ~15-16 | 73% |
+| MTP     | ~15.5 (n=4) | 76% |
+| EAGLE-3 | ~12 | 54% |
+
+- MTP is a better *predictor* (higher acceptance) but nets no throughput win: on
+  the fast MoE its per-step overhead makes it slower than DFlash; on the dense
+  model it ties.
+- EAGLE-3 (RedHatAI heads, GGUF) underperformed both, and was worst on the dense
+  model. Caveat: llama.cpp's `draft-eagle3` support is new and these heads target
+  vLLM; the weak result may partly reflect the llama.cpp implementation.
+- Classic small-model draft (gemma-4-E2B) crashed (`GGML_ASSERT n_outputs_max` in
+  `draft-simple`; E2B is a Gemma-3n MatFormer, an unusual arch).
+
+Conclusion across four drafter types: Gemma's ceiling (~15.5 t/s dense, ~50 t/s
+MoE) is a property of the model, not the drafter. Gemma yields short accepted
+runs (mean_len ~1.7-2.9) regardless of drafter; Qwen + p_min reaches 18-22. Keep
+Gemma simple (DFlash short fixed n_max, or no drafter).
+
+## Sampling and throughput
+
+Acceptance requires the target to re-sample the drafter's token, and the DFlash
+draft sampler is a fixed greedy top-k=10. So the closer the target is to greedy,
+the higher the acceptance -> the higher the throughput. Sampling is a speed knob,
+not just a quality knob:
+
+- Lower temperature -> sharper target distribution -> higher acceptance/t/s, at
+  the cost of diversity. Greedy had the highest acceptance in every sweep.
+- presence-penalty is the bigger lever: it reshapes the logits every step (even
+  at temp=0 it shifts the argmax) away from the drafter's prediction, cutting
+  acceptance sharply. High values (1.5) hurt both throughput and determinism.
+
+Guidance:
+
+- Deterministic work (code/extraction/agents): temp ~0-0.2, presence-penalty ~0.
+  Best throughput AND the desired output. A tiny temp/penalty (~0.2) guards
+  against rare greedy repetition loops at negligible acceptance cost.
+- Creative/diverse: temp ~1.0, presence-penalty ~1.5 -- accept lower speculative
+  throughput (the regime where DFlash helps least anyway).
+
+Measured deltas (dflash, best config): 35B ~89 t/s greedy vs ~87 at temp=1.0/
+pp=1.5; 27B ~27.8 greedy vs ~23.3 (+19%).
+
+## Server / deployment settings (Apple Silicon / Metal)
+
+Beyond `ngl=99` and `flash-attn` (essential, already on), the levers that matter,
+ranked:
+
+1. `ctx-size` -- the biggest memory lever. A 262144 context reserves a huge KV
+   cache up front (tens of GB even at q8_0) whether used or not. Right-size to
+   real usage (e.g. 131072 or less) to free memory for bigger models / more slots
+   and faster startup.
+2. `ubatch-size` (physical batch) -- default 512; raising to 2048 speeds prompt
+   processing / TTFT on long inputs (more prefill memory, but transient).
+   Requires `batch-size >= ubatch-size` (default batch is 2048).
+3. KV cache quant (`ctk`/`ctv`) -- q8_0 is the safe default. q4_1 halves KV memory
+   but costs long-context accuracy; keep q8_0 for deterministic/long-doc work.
+4. `parallel` (slots) -- 1 for single-user (full context per request); higher only
+   helps under concurrent load and splits the KV.
+
+Minor: `--mlock` (pin model in RAM), `--spec-draft-type-k/v` (quantize draft KV).
+Decode t/s is unaffected by these -- they trade memory and prefill/TTFT.
+
 ## Recommended models.ini
 
+Global block: deterministic profile is set per-model (`temp = 0.2`,
+`presence-penalty = 0.2`); Metal perf + right-sized context below.
+
 ```ini
+[*]
+ngl = 99
+flash-attn = true
+ubatch-size = 2048        ; faster prefill/TTFT (default 512)
+ctk = q8_0
+ctv = q8_0
+# per model: ctx-size = 131072 (halved from 262144), temp = 0.2, presence-penalty = 0.2
+
 [qwen-3.6-35B-dflash]
 model = .../Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf
 spec-draft-model = .../dflash/Qwen3.6-35B-A3B-DFlash-Q8_0.gguf
