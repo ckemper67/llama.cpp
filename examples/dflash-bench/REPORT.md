@@ -4,6 +4,23 @@ Date: 2026-07-13
 Hardware: Mac Studio (Apple Silicon), macOS 15.7.7, Metal backend
 Build: llama.cpp @ master + per-request speculative-override patch (see below)
 
+## Summary: best throughput per model
+
+Best decode t/s reached after tuning (single request, benchmark prompt, near-greedy
+sampling). The benchmark prompt is predictable, so treat these as optimistic ceilings.
+
+| Model | Type | Best drafter + config | t/s | Baseline |
+|-------|------|-----------------------|-----|----------|
+| Qwen 3.6 35B-A3B | MoE (3B active) | dflash, n_max=15, p_min=0.8 | **~89** | ~30 (dflash n=2) / ~80 (mtp) |
+| Qwen 3.6 27B | dense | dflash, n_max=15, p_min=0.8 | **~28** | ~14 (mtp) |
+| Gemma 4 26B-A4B | MoE (4B active) | dflash, n_max=2 (spec marginal) | **~53** | ~50 (no spec) / ~45 (mtp) |
+| Gemma 4 31B | dense | dflash or mtp, n_max=4 | **~15.5** | ~15.5 (ceiling) |
+
+Takeaways: Qwen wins big from dflash + adaptive `p_min` gating (35B ~3x, 27B ~2x).
+Gemma is at its ceiling regardless of drafter (DFlash, MTP, and EAGLE-3 all converge;
+EAGLE-3 was worst) - the limiter is the model, not the drafter. Lower temperature /
+presence-penalty raises all these numbers (higher draft acceptance); see Sampling below.
+
 ## Goal
 
 Find the draft-tuning settings that maximize decode throughput for DFlash
