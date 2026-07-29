@@ -8,6 +8,8 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <mach/mach_time.h>
+#include <unistd.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -515,6 +517,141 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
+}
+
+//
+// MTLCounterSampleBuffer wrapper
+//
+
+struct ggml_metal_counter_buf {
+    id<MTLCounterSampleBuffer> obj;
+    int capacity; // number of (start, end) pairs
+    // GPU tick -> CPU tick ratio, measured once at init (1.0 on Apple Silicon, where
+    // CPU and GPU timestamps share the same tick domain -- kept general in case that
+    // ever isn't true on some device/OS combination).
+    double gpu_to_cpu_ticks;
+    mach_timebase_info_data_t timebase;
+};
+
+ggml_metal_counter_buf_t ggml_metal_counter_buf_init(ggml_metal_device_t dev, int capacity) {
+    id<MTLDevice> device = ggml_metal_device_get_obj(dev);
+
+    if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        GGML_LOG_WARN("%s: device does not support atStageBoundary counter sampling\n", __func__);
+        return NULL;
+    }
+
+    id<MTLCounterSet> ts_set = nil;
+    GGML_LOG_DEBUG("%s: MTLCommonCounterSetTimestamp = %s\n", __func__,
+        MTLCommonCounterSetTimestamp ? [MTLCommonCounterSetTimestamp UTF8String] : "(nil symbol)");
+    for (id<MTLCounterSet> cs in device.counterSets) {
+        GGML_LOG_DEBUG("%s: counterSet: %s\n", __func__, [cs.name UTF8String]);
+        if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+            ts_set = cs;
+            break;
+        }
+    }
+    if (ts_set == nil) {
+        GGML_LOG_WARN("%s: no 'timestamp' counter set found on device\n", __func__);
+        return NULL;
+    }
+
+    MTLCounterSampleBufferDescriptor * desc = [MTLCounterSampleBufferDescriptor new];
+    desc.counterSet   = ts_set;
+    desc.storageMode  = MTLStorageModeShared;
+    desc.sampleCount  = capacity * 2;
+
+    NSError * error = nil;
+    id<MTLCounterSampleBuffer> obj = [device newCounterSampleBufferWithDescriptor:desc error:&error];
+    if (obj == nil) {
+        GGML_LOG_ERROR("%s: error: failed to create counter sample buffer: %s\n", __func__,
+            error ? [[error localizedDescription] UTF8String] : "unknown error");
+        return NULL;
+    }
+
+    ggml_metal_counter_buf_t res = calloc(1, sizeof(struct ggml_metal_counter_buf));
+    res->obj      = [obj retain];
+    res->capacity = capacity;
+
+    mach_timebase_info(&res->timebase);
+
+    // one-time calibration: CPU/GPU timestamps are in the same domain on Apple Silicon
+    // (ratio 1.0), but measure it rather than assume, in case that's not always true.
+    MTLTimestamp cpu0 = 0, gpu0 = 0;
+    MTLTimestamp cpu1 = 0, gpu1 = 0;
+    [device sampleTimestamps:&cpu0 gpuTimestamp:&gpu0];
+    usleep(50 * 1000);
+    [device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+
+    const double cpu_delta = (double) (cpu1 - cpu0);
+    const double gpu_delta = (double) (gpu1 - gpu0);
+    res->gpu_to_cpu_ticks = (cpu_delta > 0.0 && gpu_delta > 0.0) ? (gpu_delta / cpu_delta) : 1.0;
+
+    return res;
+}
+
+void ggml_metal_counter_buf_free(ggml_metal_counter_buf_t buf) {
+    if (!buf) {
+        return;
+    }
+    [buf->obj release];
+    free(buf);
+}
+
+int ggml_metal_counter_buf_capacity(ggml_metal_counter_buf_t buf) {
+    return buf ? buf->capacity : 0;
+}
+
+ggml_metal_encoder_t ggml_metal_encoder_init_timed(ggml_metal_cmd_buf_t cmd_buf_raw, ggml_metal_counter_buf_t buf, int start_idx, int end_idx) {
+    ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+    MTLComputePassSampleBufferAttachmentDescriptor * att = desc.sampleBufferAttachments[0];
+    att.sampleBuffer               = buf->obj;
+    att.startOfEncoderSampleIndex  = start_idx;
+    att.endOfEncoderSampleIndex    = end_idx;
+
+    res->obj = [cmd_buf computeCommandEncoderWithDescriptor:desc];
+
+    [res->obj retain];
+
+    return res;
+}
+
+bool ggml_metal_counter_buf_resolve(ggml_metal_counter_buf_t buf, int n_pairs, uint64_t * out_deltas_ns) {
+    if (!buf || n_pairs <= 0 || n_pairs > buf->capacity) {
+        return false;
+    }
+
+    NSData * data = [buf->obj resolveCounterRange:NSMakeRange(0, (NSUInteger) n_pairs * 2)];
+    if (data == nil) {
+        return false;
+    }
+
+    const MTLCounterResultTimestamp * results = (const MTLCounterResultTimestamp *) data.bytes;
+
+    for (int i = 0; i < n_pairs; i++) {
+        const uint64_t t0 = results[2*i + 0].timestamp;
+        const uint64_t t1 = results[2*i + 1].timestamp;
+
+        // some samples can be invalid (e.g. MTLCounterErrorValue) if the encoder was
+        // empty or the driver couldn't schedule the sample -- treat as zero duration
+        // rather than producing a garbage (possibly huge) delta.
+        if (t1 <= t0 || t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue) {
+            out_deltas_ns[i] = 0;
+            continue;
+        }
+
+        const double gpu_ticks = (double) (t1 - t0);
+        const double cpu_ticks = gpu_ticks / buf->gpu_to_cpu_ticks;
+        const double ns = cpu_ticks * (double) buf->timebase.numer / (double) buf->timebase.denom;
+
+        out_deltas_ns[i] = (uint64_t) ns;
+    }
+
+    return true;
 }
 
 struct ggml_metal_device {

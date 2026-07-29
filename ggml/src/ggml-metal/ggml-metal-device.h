@@ -2,6 +2,8 @@
 
 #include "ggml.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -90,6 +92,36 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+
+//
+// MTLCounterSampleBuffer wrapper -- per-encoder GPU timestamp sampling.
+//
+// Used for GGML_METAL_OP_TIMING: this hardware/OS combination does not support
+// MTLCounterSamplingPointAtDispatchBoundary (verified: false on M1 Ultra), so we
+// cannot sample between individual dispatches within one encoder the way Xcode's
+// GPU capture does. What *is* supported is AtStageBoundary, which gives real GPU
+// timestamps at the start/end of a whole compute encoder. To time a specific op,
+// give it its own encoder (see ggml_metal_encoder_init_timed) and read back the
+// (start, end) pair after the command buffer completes.
+//
+
+typedef struct ggml_metal_counter_buf * ggml_metal_counter_buf_t;
+
+// NULL if the device doesn't support stage-boundary counter sampling.
+ggml_metal_counter_buf_t ggml_metal_counter_buf_init(ggml_metal_device_t dev, int capacity);
+void ggml_metal_counter_buf_free(ggml_metal_counter_buf_t buf);
+
+// number of (start, end) timestamp pairs the buffer can hold
+int ggml_metal_counter_buf_capacity(ggml_metal_counter_buf_t buf);
+
+// like ggml_metal_encoder_init, but the encoder samples a GPU timestamp into
+// buf[start_idx] when it begins and buf[end_idx] when it ends (endEncoding).
+ggml_metal_encoder_t ggml_metal_encoder_init_timed(ggml_metal_cmd_buf_t cmd_buf_raw, ggml_metal_counter_buf_t buf, int start_idx, int end_idx);
+
+// resolves buf[0, n_pairs*2) and writes n_pairs deltas (end - start, in nanoseconds)
+// to out_deltas_ns. Only call after the command buffer(s) that wrote into buf have
+// completed. Returns false on failure (out_deltas_ns left untouched).
+bool ggml_metal_counter_buf_resolve(ggml_metal_counter_buf_t buf, int n_pairs, uint64_t * out_deltas_ns);
 
 //
 // MTLLibrary wrapper

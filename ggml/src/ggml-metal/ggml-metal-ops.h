@@ -2,6 +2,8 @@
 
 #include "ggml-metal-device.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,7 +20,20 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion);
+        int  debug_fusion,
+        // per-op fusion counters, owned by the caller (array of GGML_OP_COUNT uint64_t,
+        // indexed by ggml_op); incremented atomically since encoding may run across
+        // n_cb concurrent threads. NULL to disable (debug_fusion == 0 callers pass NULL).
+        uint64_t * fuse_cnt,
+        // GGML_METAL_OP_TIMING: NULL op_timing_buf disables it. op_timing_next is a
+        // shared pair-index allocator (plain int, incremented via __atomic_fetch_add --
+        // not atomic_int, to avoid stdatomic.h vs <atomic> friction across the C/C++
+        // boundary this header straddles); op_timing_ops[pair_idx] records which op
+        // each pair measured, sized op_timing_cap entries.
+        ggml_metal_counter_buf_t op_timing_buf,
+        int  * op_timing_next,
+        enum ggml_op * op_timing_ops,
+        int  op_timing_cap);
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 

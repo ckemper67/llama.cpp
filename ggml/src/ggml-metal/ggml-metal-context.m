@@ -46,6 +46,19 @@ struct ggml_metal {
     // how many times a given op was fused
     uint64_t fuse_cnt[GGML_OP_COUNT];
 
+    // GGML_METAL_OP_TIMING: per-encoder GPU timestamp sampling for specific ops
+    // (see ggml-metal-device.h for why this is per-encoder and not per-dispatch).
+    int op_timing;
+    ggml_metal_counter_buf_t op_timing_buf; // NULL if disabled or unsupported by the device
+    // next free (start,end) pair index into op_timing_buf. Plain int, not atomic_int:
+    // accessed via __atomic_* builtins on both sides of the ggml-metal-ops.h boundary
+    // (that header is included from both C/ObjC here and C++ in ggml-metal-ops.cpp).
+    int op_timing_next;
+    enum ggml_op * op_timing_ops;           // [capacity]: which op each pair measured
+
+    uint64_t op_timing_ns[GGML_OP_COUNT];
+    uint64_t op_timing_calls[GGML_OP_COUNT];
+
     // capture state
     int capture_compute;
     bool capture_started;
@@ -154,6 +167,32 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     memset(res->fuse_cnt, 0, sizeof(res->fuse_cnt));
 
+    res->op_timing_buf = NULL;
+    res->op_timing_ops = NULL;
+    res->op_timing_next = 0;
+    memset(res->op_timing_ns,    0, sizeof(res->op_timing_ns));
+    memset(res->op_timing_calls, 0, sizeof(res->op_timing_calls));
+
+    {
+        const char * val = getenv("GGML_METAL_OP_TIMING");
+        res->op_timing = val ? atoi(val) : 0;
+    }
+
+    if (res->op_timing > 0) {
+        // hardware limit observed on M1 Ultra: max sample buffer is 32768 bytes
+        // (8 bytes/timestamp), i.e. 4096 samples = 2048 (start,end) pairs. Leave
+        // headroom below that rather than assume it's a hard/portable ceiling.
+        const int cap = 2000;
+        res->op_timing_buf = ggml_metal_counter_buf_init(res->dev, cap);
+        if (res->op_timing_buf == NULL) {
+            GGML_LOG_WARN("%s: GGML_METAL_OP_TIMING requested but could not create the counter "
+                           "sample buffer (see preceding log line for why) -- disabled\n", __func__);
+            res->op_timing = 0;
+        } else {
+            res->op_timing_ops = calloc(cap, sizeof(enum ggml_op));
+        }
+    }
+
     GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, res->use_fusion         ? "true" : "false");
     GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
     GGML_LOG_INFO("%s: use graph optimize = %s\n", __func__, res->use_graph_optimize ? "true" : "false");
@@ -220,6 +259,26 @@ void ggml_metal_free(ggml_metal_t ctx) {
             GGML_LOG_DEBUG("%s: - %s: %" PRIu64 "\n", __func__, ggml_op_name((enum ggml_op) i), ctx->fuse_cnt[i]);
         }
     }
+
+    if (ctx->op_timing > 0) {
+        GGML_LOG_DEBUG("%s: op timing stats (GPU time, per-encoder sampling):\n", __func__);
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            if (ctx->op_timing_calls[i] == 0) {
+                continue;
+            }
+
+            const double total_ms = (double) ctx->op_timing_ns[i] / 1e6;
+            const double avg_us   = (double) ctx->op_timing_ns[i] / 1e3 / (double) ctx->op_timing_calls[i];
+
+            GGML_LOG_DEBUG("%s: - %s: %" PRIu64 " calls, %.3f ms total, %.1f us avg\n",
+                __func__, ggml_op_name((enum ggml_op) i), ctx->op_timing_calls[i], total_ms, avg_us);
+        }
+    }
+
+    if (ctx->op_timing_buf) {
+        ggml_metal_counter_buf_free(ctx->op_timing_buf);
+    }
+    free(ctx->op_timing_ops);
 
     Block_release(ctx->encode_async);
 
@@ -291,6 +350,30 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
 
         [ctx->cmd_bufs_ext removeAllObjects];
+    }
+
+    // resolve and accumulate any op timing samples recorded since the last call.
+    // safe here: all command buffers are confirmed complete above, so every
+    // (start,end) pair up to op_timing_next has real GPU timestamps written.
+    if (ctx->op_timing_buf) {
+        const int n_pairs = __atomic_exchange_n(&ctx->op_timing_next, 0, __ATOMIC_RELAXED);
+
+        if (n_pairs > 0) {
+            uint64_t * deltas_ns = malloc(sizeof(uint64_t) * (size_t) n_pairs);
+
+            if (ggml_metal_counter_buf_resolve(ctx->op_timing_buf, n_pairs, deltas_ns)) {
+                for (int i = 0; i < n_pairs; i++) {
+                    const enum ggml_op op = ctx->op_timing_ops[i];
+
+                    ctx->op_timing_ns[op]    += deltas_ns[i];
+                    ctx->op_timing_calls[op] += 1;
+                }
+            } else {
+                GGML_LOG_WARN("%s: failed to resolve %d op timing samples\n", __func__, n_pairs);
+            }
+
+            free(deltas_ns);
+        }
     }
 }
 
@@ -702,7 +785,12 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_compute,
             ctx->debug_graph,
-            ctx->debug_fusion);
+            ctx->debug_fusion,
+            ctx->fuse_cnt,
+            ctx->op_timing_buf,
+            &ctx->op_timing_next,
+            ctx->op_timing_ops,
+            ggml_metal_counter_buf_capacity(ctx->op_timing_buf));
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
