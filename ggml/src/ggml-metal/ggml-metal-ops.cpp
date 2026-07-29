@@ -36,9 +36,15 @@ struct ggml_metal_op {
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion) {
+        int  debug_fusion,
+        uint64_t * fuse_cnt,
+        ggml_metal_counter_buf_t op_timing_buf,
+        int  * op_timing_next,
+        ggml_op * op_timing_ops,
+        int  op_timing_cap) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
+        this->cmd_buf         = cmd_buf;
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->idx_start       = idx_start;
@@ -48,6 +54,11 @@ struct ggml_metal_op {
         this->use_capture     = use_capture;
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
+        this->fuse_cnt        = fuse_cnt;
+        this->op_timing_buf   = op_timing_buf;
+        this->op_timing_next  = op_timing_next;
+        this->op_timing_ops   = op_timing_ops;
+        this->op_timing_cap   = op_timing_cap;
         this->gf              = gf;
 
         idxs.reserve(gf->n_nodes);
@@ -88,6 +99,40 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // GGML_METAL_OP_TIMING: run `dispatch` in its own encoder with GPU timestamp
+    // sampling attached, recording the result under `op`. Ends the current shared
+    // encoder before and starts a fresh one after, since the hardware only supports
+    // stage- (whole-encoder-) boundary sampling, not per-dispatch (see
+    // ggml-metal-device.h). Falls back to running `dispatch` on the normal shared
+    // encoder, untimed, if timing is disabled or the pair-index space is exhausted.
+    template <typename F>
+    void encode_timed(ggml_op op, F dispatch) {
+        if (!op_timing_buf) {
+            dispatch();
+            return;
+        }
+
+        const int pair_idx = __atomic_fetch_add(op_timing_next, 1, __ATOMIC_RELAXED);
+        if (pair_idx >= op_timing_cap) {
+            // out of sample slots for this pass -- run untimed rather than drop the op
+            dispatch();
+            return;
+        }
+
+        op_timing_ops[pair_idx] = op;
+
+        ggml_metal_encoder_end_encoding(enc);
+        ggml_metal_encoder_free(enc);
+
+        enc = ggml_metal_encoder_init_timed(cmd_buf, op_timing_buf, 2*pair_idx, 2*pair_idx + 1);
+        dispatch();
+        ggml_metal_encoder_end_encoding(enc);
+        ggml_metal_encoder_free(enc);
+
+        // resume normal (untimed, possibly concurrent) encoding for subsequent ops
+        enc = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -100,7 +145,16 @@ struct ggml_metal_op {
     int debug_graph;
     int debug_fusion;
 
+    uint64_t * fuse_cnt;
+
+    ggml_metal_counter_buf_t op_timing_buf;
+    int      * op_timing_next;
+    ggml_op  * op_timing_ops;
+    int        op_timing_cap;
+
 private:
+    ggml_metal_cmd_buf_t cmd_buf;
+
     ggml_cgraph * gf;
 
     int idx_start;
@@ -120,7 +174,12 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int debug_graph,
-        int debug_fusion) {
+        int debug_fusion,
+        uint64_t * fuse_cnt,
+        ggml_metal_counter_buf_t op_timing_buf,
+        int * op_timing_next,
+        enum ggml_op * op_timing_ops,
+        int op_timing_cap) {
     ggml_metal_op_t res = new ggml_metal_op(
         dev,
         cmd_buf,
@@ -131,7 +190,12 @@ ggml_metal_op_t ggml_metal_op_init(
         use_concurrency,
         use_capture,
         debug_graph,
-        debug_fusion);
+        debug_fusion,
+        fuse_cnt,
+        op_timing_buf,
+        op_timing_next,
+        op_timing_ops,
+        op_timing_cap);
 
     return res;
 }
@@ -336,11 +400,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
         case GGML_OP_SSM_CONV:
             {
-                n_fuse = ggml_metal_op_ssm_conv(ctx, idx);
+                ctx->encode_timed(node->op, [&]{ n_fuse = ggml_metal_op_ssm_conv(ctx, idx); });
             } break;
         case GGML_OP_SSM_SCAN:
             {
-                n_fuse = ggml_metal_op_ssm_scan(ctx, idx);
+                ctx->encode_timed(node->op, [&]{ n_fuse = ggml_metal_op_ssm_scan(ctx, idx); });
             } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
@@ -349,7 +413,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
         case GGML_OP_GATED_DELTA_NET:
             {
-                n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
+                ctx->encode_timed(node->op, [&]{ n_fuse = ggml_metal_op_gated_delta_net(ctx, idx); });
             } break;
         case GGML_OP_SOLVE_TRI:
             {
@@ -3492,7 +3556,11 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
                 break;
             }
 
-            //ctx->fuse_cnt[ops[n_fuse + 1]->op]++;
+            // encoding can run concurrently across n_cb threads (see ggml-metal-context.m) -
+            // this counter is shared across the graph, so the increment must be atomic.
+            if (ctx->fuse_cnt) {
+                __atomic_fetch_add(&ctx->fuse_cnt[f1->op], 1, __ATOMIC_RELAXED);
+            }
 
             args.o1[n_fuse + 1] = bid_fuse.offs;
         }
@@ -3775,7 +3843,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
                 break;
             }
 
-            //ctx->fuse_cnt[f1->op]++;
+            // see the matching comment at the other fuse_cnt site above: encoding can run
+            // concurrently across n_cb threads, so this increment must be atomic.
+            if (ctx->fuse_cnt) {
+                __atomic_fetch_add(&ctx->fuse_cnt[f1->op], 1, __ATOMIC_RELAXED);
+            }
 
             bid_fuse[n_fuse] = ggml_metal_get_buffer_id(f1->src[1]);
 
