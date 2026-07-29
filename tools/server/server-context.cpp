@@ -809,6 +809,16 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // time-to-first-token: request enqueue -> first generated token (includes queue wait)
+    server_metrics_histogram ttft_hist = server_metrics_histogram({
+        0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0
+    });
+    // time-per-output-token: average decode latency per generated token, one observation per
+    // completed request (not per-token, to avoid instrumenting the hot sampling loop)
+    server_metrics_histogram tpot_hist = server_metrics_histogram({
+        0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5
+    });
+
     void init() {
         t_start = ggml_time_us();
     }
@@ -822,11 +832,26 @@ struct server_metrics {
         n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
     }
 
+    // called once per request, right when the first token is sampled
+    void on_first_token(const server_slot & slot, int64_t t_now_us) {
+        if (slot.task) {
+            const double ttft_sec = (double) (t_now_us - slot.task->t_enqueued_us) / 1e6;
+            if (ttft_sec >= 0.0) {
+                ttft_hist.observe(ttft_sec);
+            }
+        }
+    }
+
     void on_prediction(const server_slot & slot) {
         n_tokens_predicted_total   += slot.n_decoded;
         n_tokens_predicted         += slot.n_decoded;
         t_tokens_generation        += slot.t_token_generation;
         t_tokens_generation_total  += slot.t_token_generation;
+
+        if (slot.n_decoded > 0) {
+            const double tpot_sec = (slot.t_token_generation / (double) slot.n_decoded) / 1e3;
+            tpot_hist.observe(tpot_sec);
+        }
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
@@ -2465,11 +2490,19 @@ private:
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
 
+                    uint64_t kv_cache_used_tokens = 0;
+
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
+
+                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            if (pos_min >= 0 && pos_max >= pos_min) {
+                                kv_cache_used_tokens += (uint64_t) (pos_max - pos_min + 1);
+                            }
                         } else {
                             n_idle_slots++;
                         }
@@ -2500,6 +2533,11 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    res->ttft_hist              = metrics.ttft_hist;
+                    res->tpot_hist              = metrics.tpot_hist;
+                    res->kv_cache_used_tokens   = kv_cache_used_tokens;
+                    res->kv_cache_total_tokens  = (uint64_t) n_ctx;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3767,6 +3805,7 @@ private:
                 slot.n_decoded_last = 0;
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                 metrics.on_prompt_eval(slot);
+                metrics.on_first_token(slot, t_now);
             }
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
@@ -4413,6 +4452,16 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            },{
+                    {"name",  "kv_cache_usage_ratio"},
+                    {"help",  "KV cache usage. 1 means 100 percent usage."},
+                    {"value",  res_task->kv_cache_total_tokens
+                                    ? (double) res_task->kv_cache_used_tokens / (double) res_task->kv_cache_total_tokens
+                                    : 0.}
+            },{
+                    {"name",  "kv_cache_used_tokens"},
+                    {"help",  "KV cache usage in tokens."},
+                    {"value",  (uint64_t) res_task->kv_cache_used_tokens}
             }}}
         };
 
@@ -4432,6 +4481,24 @@ void server_routes::init_routes() {
                             << "llamacpp:"        << name << " " << value << "\n";
             }
         }
+
+        // histograms: emit in the same cumulative-bucket Prometheus shape vLLM uses
+        // (le="<bound>" per bucket, ascending, plus a synthetic +Inf bucket, _sum, _count)
+        auto emit_histogram = [&](const std::string & name, const std::string & help,
+                                   const server_metrics_histogram & hist) {
+            prometheus << "# HELP llamacpp:" << name << " " << help << "\n"
+                        << "# TYPE llamacpp:" << name << " histogram\n";
+            for (size_t i = 0; i < hist.bounds_sec.size(); i++) {
+                prometheus << "llamacpp:" << name << "_bucket{le=\"" << hist.bounds_sec[i] << "\"} "
+                            << hist.counts[i] << "\n";
+            }
+            prometheus << "llamacpp:" << name << "_bucket{le=\"+Inf\"} " << hist.total << "\n"
+                        << "llamacpp:" << name << "_sum " << hist.sum_sec << "\n"
+                        << "llamacpp:" << name << "_count " << hist.total << "\n";
+        };
+
+        emit_histogram("ttft_seconds", "Time to first token in seconds (includes queue wait).", res_task->ttft_hist);
+        emit_histogram("tpot_seconds", "Time per output token in seconds (per-request average).", res_task->tpot_hist);
 
         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
         res->content_type = "text/plain; version=0.0.4";

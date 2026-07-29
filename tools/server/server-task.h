@@ -13,6 +13,29 @@
 
 using json = nlohmann::ordered_json;
 
+// fixed-bucket histogram used for TTFT / TPOT distributions exposed over /metrics
+// (mirrors the vLLM Prometheus histogram shape: cumulative per-bucket counts + sum + count)
+struct server_metrics_histogram {
+    std::vector<double>   bounds_sec; // upper bound (le) of each bucket, ascending
+    std::vector<uint64_t> counts;     // cumulative count of observations <= bounds_sec[i]
+    double                sum_sec = 0.0;
+    uint64_t              total   = 0;
+
+    explicit server_metrics_histogram(std::vector<double> bounds = {}) : bounds_sec(std::move(bounds)) {
+        counts.assign(bounds_sec.size(), 0);
+    }
+
+    void observe(double value_sec) {
+        for (size_t i = 0; i < bounds_sec.size(); i++) {
+            if (value_sec <= bounds_sec[i]) {
+                counts[i]++;
+            }
+        }
+        sum_sec += value_sec;
+        total++;
+    }
+};
+
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
@@ -135,6 +158,10 @@ struct task_result_state {
 
 struct server_task {
     int id = -1; // to be filled by server_queue
+
+    // time this task was constructed, i.e. when the request was accepted by the server
+    // (used to compute time-to-first-token including queue wait, for the /metrics histogram)
+    int64_t t_enqueued_us = ggml_time_us();
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
@@ -531,6 +558,13 @@ struct server_task_result_metrics : server_task_result {
 
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
+
+    // time-to-first-token and time-per-output-token distributions (seconds), and KV cache
+    // occupancy, exposed as additional /metrics entries
+    server_metrics_histogram ttft_hist;
+    server_metrics_histogram tpot_hist;
+    uint64_t kv_cache_used_tokens  = 0;
+    uint64_t kv_cache_total_tokens = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
