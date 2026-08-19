@@ -21,7 +21,12 @@ static void signal_handler(int) {
         // make sure to clear colors before exiting (not using LOG or console.cpp here to avoid deadlock)
         fprintf(stdout, "\033[0m\n");
         fflush(stdout);
-        std::exit(130);
+        // use _exit(), not std::exit(): std::exit() runs static-storage-duration destructors but
+        // does not unwind the stack, so a still-alive local cli_context (and, via the embedded
+        // server thread, the loaded model's GPU buffers) never gets destructed/released. The
+        // static GPU backend teardown that follows then finds those buffers still registered and
+        // aborts. _exit() skips static destructors too, which is what "exit immediately" should do.
+        std::_Exit(130);
     }
     cli_context::interrupted().store(true);
 }

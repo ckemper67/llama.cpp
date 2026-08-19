@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -29,8 +30,16 @@ static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
+        //
+        // note: use _exit(), not exit(). exit() runs static-storage-duration destructors but does
+        // not unwind the call stack, so stack-local objects still alive further up (e.g. the
+        // server_context holding the loaded model and its GPU buffers) never get destructed and
+        // never release their buffers. The subsequent static teardown of the GPU backend then finds
+        // those buffers still registered and aborts (see ggml_metal_rsets_free). _exit() skips all
+        // of that -- including static destructors -- which is the correct behavior for "terminate
+        // immediately" anyway: a force-quit shouldn't get stuck waiting on a graceful GPU drain.
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        std::_Exit(1);
     }
 
     shutdown_handler(signal);
