@@ -11787,6 +11787,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // dense 27B decode mat-vec (hidden 5120, ffn 17408). 4 independent src0 matrices
+    // (bs = {4, 1}) so the working set exceeds the system level cache and the timing
+    // reflects DRAM bandwidth rather than cache hits across perf iterations.
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ {17408, 5120}, {5120, 17408} }) {
+        for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, k, {4, 1}, {1, 1}));
+        }
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
