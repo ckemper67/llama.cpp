@@ -53,10 +53,10 @@
 #define N_R0_Q3_K 2
 #define N_SG_Q3_K 2
 
-#define N_R0_Q4_K 2
+#define N_R0_Q4_K 4
 #define N_SG_Q4_K 2
 
-#define N_R0_Q5_K 1
+#define N_R0_Q5_K 4
 #define N_SG_Q5_K 2
 
 #define N_R0_Q6_K 2
@@ -93,7 +93,7 @@
 #define N_R0_IQ4_NL 2
 #define N_SG_IQ4_NL 2
 
-#define N_R0_IQ4_XS 2
+#define N_R0_IQ4_XS 4
 #define N_SG_IQ4_XS 2
 
 #define N_R0_TQ2_0 4
