@@ -360,6 +360,137 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+// small-batch mat-mat for 2..8 src1 columns (e.g. speculative decoding verification)
+//
+// the mat-vec kernels dequantize src0 again for every src1 column and kernel_mul_mm pads the
+// batch to 32 columns over 64-row tiles, which leaves few threadgroups for small ne01. here
+// every simdgroup owns 8 src0 rows and all (up to 8) src1 columns: each weight is dequantized
+// once into the simdgroup's own threadgroup tile and multiplied against the shared src1 tile
+// with 8x8 simdgroup matrices
+//
+// requires: ne00 % 64 == 0, ne11 <= 8, contiguous src1 rows
+constant constexpr short MM_SB_NSG = N_MM_SB_NSG; // simdgroups per threadgroup
+constant constexpr short MM_SB_NK  = N_MM_SB_NK;  // k per step: 8 rows x 64 k = one 16-weight dequant per thread
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_sb(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NK = MM_SB_NK;
+
+    // [NK/8] blocks of 8x8 half, row-major (8*row + col):
+    //   sb: shared src1 tile, block kb holds (token, k = 8*kb + col)
+    //   sa: this simdgroup's src0 tile, block kb holds (k = 8*kb + row, src0 row = col)
+    threadgroup half  * sb = (threadgroup half  *) shmem;
+    threadgroup half  * sa = (threadgroup half  *) shmem + 8*NK + sgitg*8*NK;
+    threadgroup float * so = (threadgroup float *) ((threadgroup half *) shmem + 8*NK + MM_SB_NSG*8*NK) + sgitg*64;
+
+    const int im = tgpig.z;
+    const int r0 = (tgpig.x*MM_SB_NSG + sgitg)*8;
+
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    // src0: lane -> (row, 16-weight chunk within the step). rows past ne0 load the last row and
+    // their results are dropped on store
+    const short lr = tiisg/4;
+    const short lc = tiisg%4;
+
+    const int row = min(r0 + lr, args.ne0 - 1);
+
+    device const block_q * x = (device const block_q *) (src0 + args.nb01*row + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03);
+
+    // src1: thread -> (token, 4 consecutive k). tokens past ne1 are zero
+    const short bt = tiitg/16;
+    const short bk = 4*(tiitg%16);
+
+    const bool bt_valid = bt < args.ne1;
+
+    device const float * y = (device const float *) (src1 + args.nb11*(bt_valid ? bt : 0) + args.nb12*i12 + args.nb13*i13) + bk;
+
+    simdgroup_half8x8  ma;
+    simdgroup_half8x8  mb;
+    simdgroup_float8x8 mc = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    // per step every thread dequantizes NJ 16-weight chunks and loads NJ float4 of src1
+    constexpr short NJ = NK/64;
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // issue the global loads before waiting on the previous step's readers
+        half4x4 temp_a[NJ];
+        FOR_UNROLL (short j = 0; j < NJ; j++) {
+            const int ic = loop_k/16 + lc + 4*j; // global 16-weight chunk index
+            dequantize_func(x + ic/nl, ic%nl, temp_a[j]);
+        }
+
+        float4 yv[NJ];
+        FOR_UNROLL (short j = 0; j < NJ; j++) {
+            yv[j] = bt_valid ? *((device const float4 *) (y + loop_k + 64*j)) : float4(0.f);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short j = 0; j < NJ; j++) {
+            const short k = bk + 64*j;
+            *((threadgroup half4 *) (sb + 64*(k/8) + 8*bt + k%8)) = half4(yv[j]);
+        }
+
+        FOR_UNROLL (short j = 0; j < NJ; j++) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
+                const short k = 16*(lc + 4*j) + i;
+                sa[64*(k/8) + 8*(k%8) + lr] = temp_a[j][i/4][i%4];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short kb = 0; kb < NK/8; kb++) {
+            simdgroup_load(ma, sa + 64*kb, 8, 0, false);
+            simdgroup_load(mb, sb + 64*kb, 8, 0, false);
+
+            simdgroup_multiply_accumulate(mc, mb, ma, mc);
+        }
+    }
+
+    // mc is (token, src0 row): stage it and store only the valid part
+    simdgroup_store(mc, so, 8, 0, false);
+
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float * D = (device float *) dst + (int64_t) im*args.ne1*args.ne0;
+
+    for (short e = tiisg; e < 64; e += 32) {
+        const short t = e/8;
+        const short r = e%8;
+
+        if (t < args.ne1 && r0 + r < args.ne0) {
+            D[(int64_t) t*args.ne0 + r0 + r] = so[e];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_sb<block_q4_0, 2, dequantize_q4_0>) mul_mm_sb_t;
+
+template [[host_name("kernel_mul_mm_sb_q4_0_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q4_0,   2,     dequantize_q4_0>;
+template [[host_name("kernel_mul_mm_sb_q4_1_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q4_1,   2,     dequantize_q4_1>;
+template [[host_name("kernel_mul_mm_sb_q5_0_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q5_0,   2,     dequantize_q5_0>;
+template [[host_name("kernel_mul_mm_sb_q5_1_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q5_1,   2,     dequantize_q5_1>;
+template [[host_name("kernel_mul_mm_sb_q8_0_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q8_0,   2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mm_sb_q2_K_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q2_K,   QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mm_sb_q3_K_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q3_K,   QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_mul_mm_sb_q4_K_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q4_K,   QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mm_sb_q5_K_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q5_K,   QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_mul_mm_sb_q6_K_f32")]]   kernel mul_mm_sb_t kernel_mul_mm_sb<block_q6_K,   QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_mul_mm_sb_iq4_nl_f32")]] kernel mul_mm_sb_t kernel_mul_mm_sb<block_iq4_nl, 2,     dequantize_iq4_nl>;
+template [[host_name("kernel_mul_mm_sb_iq4_xs_f32")]] kernel mul_mm_sb_t kernel_mul_mm_sb<block_iq4_xs, QK_NL, dequantize_iq4_xs>;
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,
