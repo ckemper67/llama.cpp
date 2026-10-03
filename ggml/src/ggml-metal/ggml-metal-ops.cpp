@@ -2616,13 +2616,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // small-batch mat-mat: dequantize each weight once for all (4..16) columns
+    // small-batch mat-mat: dequantize each weight once for all (5..16) columns
     // GGML_METAL_MUL_MM_SB_DISABLE=1 falls back to the kernels below (for A/B comparisons)
     static const bool mm_sb_disabled = getenv("GGML_METAL_MUL_MM_SB_DISABLE") != nullptr;
 
     if (!mm_sb_disabled && props_dev->has_simdgroup_mm &&
         op->src[1]->type == GGML_TYPE_F32 && nb10 == sizeof(float) &&
         ne00 % N_MM_SB_NK == 0 && ne11 >= N_MM_SB_NE11_MIN && ne11 <= N_MM_SB_NE11_MAX &&
+        (ne11 > 8 || (int64_t) ne00*ne01 >= (ne11 >= 6 ? N_MM_SB_NE_MIN_6 : N_MM_SB_NE_MIN_5)) &&
         (
          op->src[0]->type == GGML_TYPE_Q4_0   ||
          op->src[0]->type == GGML_TYPE_Q4_1   ||
