@@ -51,7 +51,7 @@
 #define N_MM_SB_NSG 4
 #define N_MM_SB_NK  64
 #define N_MM_SB_NE11_MIN 4 // below this the mat-vec kernels are faster (M1 Ultra)
-#define N_MM_SB_NE11_MAX 8
+#define N_MM_SB_NE11_MAX 16
 
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2

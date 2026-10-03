@@ -2616,7 +2616,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // small-batch mat-mat: dequantize each weight once for all (2..8) columns
+    // small-batch mat-mat: dequantize each weight once for all (4..16) columns
     // GGML_METAL_MUL_MM_SB_DISABLE=1 falls back to the kernels below (for A/B comparisons)
     static const bool mm_sb_disabled = getenv("GGML_METAL_MUL_MM_SB_DISABLE") != nullptr;
 

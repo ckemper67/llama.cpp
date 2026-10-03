@@ -986,20 +986,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_sb(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
 
-    snprintf(base, 256, "kernel_mul_mm_sb_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type));
+    // number of 8-column src1 blocks
+    const int nc = (op->src[1]->ne[1] + 7)/8;
+    GGML_ASSERT(nc >= 1 && nc <= 2);
+
+    snprintf(base, 256, "kernel_mul_mm_sb_%s_%s_nc%d", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), nc);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
     }
 
-    // 8 rows per simdgroup, all (<= 8) src1 columns in one threadgroup
+    // 8 rows per simdgroup, all (<= 8*nc) src1 columns in one threadgroup
     res.nr0  = 8*N_MM_SB_NSG;
-    res.nr1  = N_MM_SB_NE11_MAX;
+    res.nr1  = 8*nc;
     res.nsg  = N_MM_SB_NSG;
 
     // src1 tile + one src0 tile per simdgroup (half), output staging per simdgroup (float)
-    res.smem = (8*N_MM_SB_NK + N_MM_SB_NSG*8*N_MM_SB_NK)*sizeof(ggml_fp16_t) + N_MM_SB_NSG*64*sizeof(float);
+    res.smem = (nc*8*N_MM_SB_NK + N_MM_SB_NSG*8*N_MM_SB_NK)*sizeof(ggml_fp16_t) + N_MM_SB_NSG*nc*64*sizeof(float);
 
     return res;
 }
