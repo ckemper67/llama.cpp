@@ -451,16 +451,16 @@ kernel void kernel_mul_mm_sb(
         }
 
         FOR_UNROLL (short j = 0; j < NJ; j++) {
-            FOR_UNROLL (short i = 0; i < 16; i++) {
-                const short k = 16*(lc + 4*j) + i;
-                sa[64*(k/8) + 8*(k%8) + lr] = temp_a[j][i/4][i%4];
+            FOR_UNROLL (short q = 0; q < 4; q++) {
+                const short k = 16*(lc + 4*j) + 4*q;
+                *((threadgroup half4 *) (sa + 64*(k/8) + 8*lr + k%8)) = temp_a[j][q];
             }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         FOR_UNROLL (short kb = 0; kb < NK/8; kb++) {
-            simdgroup_load(ma, sa + 64*kb, 8, 0, false);
+            simdgroup_load(ma, sa + 64*kb, 8, 0, true);
 
             FOR_UNROLL (short c = 0; c < NC; c++) {
                 simdgroup_load(mb, sb + 64*(c*(NK/8) + kb), 8, 0, false);
