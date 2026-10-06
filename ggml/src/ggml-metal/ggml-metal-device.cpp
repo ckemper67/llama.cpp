@@ -1008,6 +1008,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_sb(ggml_m
     return res;
 }
 
+// split-K mat-vec (FC_mul_mv_ksplit): simdgroups per threadgroup that share its rows and split K, or 0
+// for one simdgroup per row group. few rows leave the GPU underfed, so they get split. per type, from
+// llama-roofline replays of a dense 27B on M1 Ultra:
+//   q4_K, q5_K: split up to 8192 rows (q5_K 17408 x 5120 452 -> 552 GB/s at 4, 6144 x 5120 422 -> 460 at 2),
+//               wide matrices lose
+//   iq4_xs:     split always (5120 x 17408 543 -> 563 GB/s at 2, 17408 x 5120 502 -> 540 at 4)
+//   q6_K:       2 always (17408 x 5120 543 -> 587 GB/s, 6144 x 5120 540 -> 569)
+// GGML_METAL_MV_KSPLIT=<n> forces n simdgroups (0 or 1 = off) for A/B runs
+static int ggml_metal_mul_mv_ksplit(ggml_type type, int64_t ne00, int64_t ne01) {
+    static const int ks_env = getenv("GGML_METAL_MV_KSPLIT") ? atoi(getenv("GGML_METAL_MV_KSPLIT")) : -1;
+    if (ks_env >= 0) {
+        return ks_env > 1 ? ks_env : 0;
+    }
+    const int by_aspect = ne00 >= 2*ne01 ? 4 : 2;
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:   return ne01 > 8192 ? 0 : by_aspect;
+        case GGML_TYPE_IQ4_XS: return by_aspect;
+        case GGML_TYPE_Q6_K:   return 2;
+        default:               return 0;
+    }
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1104,18 +1127,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+                if (const int ks = ggml_metal_mul_mv_ksplit(tsrc0, ne00, ne01)) {
+                    ksplit = true;
+                    nsg    = ks;
+                }
+                smem = nsg*nr0*sizeof(float);
             } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
 
-                // split K over the simdgroups when there are few rows for the GPU (measured on M1 Ultra:
-                // 17408 x 5120 452 -> 552 GB/s at 4, 6144 x 5120 422 -> 465 GB/s at 2; wide matrices lose)
-                // GGML_METAL_MV_KSPLIT=<n> forces n simdgroups (0 or 1 = off) for A/B runs
-                static const int ks_env = getenv("GGML_METAL_MV_KSPLIT") ? atoi(getenv("GGML_METAL_MV_KSPLIT")) : -1;
-                const int ks = ks_env >= 0 ? ks_env : (ne01 > 8192 ? 0 : (ne00 >= 2*ne01 ? 4 : 2));
-                if (ks > 1) {
+                if (const int ks = ggml_metal_mul_mv_ksplit(tsrc0, ne00, ne01)) {
                     ksplit = true;
                     nsg    = ks;
                 }
@@ -1125,6 +1148,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+                if (const int ks = ggml_metal_mul_mv_ksplit(tsrc0, ne00, ne01)) {
+                    ksplit = true;
+                    nsg    = ks;
+                }
+                smem = nsg*nr0*sizeof(float);
             } break;
         case GGML_TYPE_IQ2_XXS:
             {
@@ -1218,7 +1246,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_IQ4_XS;
                 nr0 = N_R0_IQ4_XS;
-                smem = 32*sizeof(float);
+                if (const int ks = ggml_metal_mul_mv_ksplit(tsrc0, ne00, ne01)) {
+                    ksplit = true;
+                    nsg    = ks;
+                }
+                smem = (32 + nsg*nr0)*sizeof(float); // lookup table + split-K partial sums
             } break;
         case GGML_TYPE_TQ2_0:
             {

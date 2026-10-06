@@ -221,6 +221,41 @@ constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
 constant bool  FC_mul_mv_ksplit_v [[function_constant(FC_MUL_MV + 6)]];
 constant bool  FC_mul_mv_ksplit = is_function_constant_defined(FC_mul_mv_ksplit_v) && FC_mul_mv_ksplit_v;
 
+// writes the nr0 row sums of a mat-vec simdgroup. with split-K (ks) the simdgroups hold partial sums of
+// the same rows: they go through `part` (nsg*nr0 floats of threadgroup memory) and simdgroup 0 adds them
+template<short nr0>
+static inline void mul_mv_store_rows(
+        thread const float * sumf, bool ks, short nsg, threadgroup float * part,
+        device float * dst_f32, int first_row, int ne0, ushort tiisg, ushort sgitg) {
+    if (ks) {
+        for (short row = 0; row < nr0; ++row) {
+            const float tot = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                part[sgitg*nr0 + row] = tot;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg < nr0 && first_row + tiisg < ne0) {
+            float tot = 0.0f;
+            for (short s = 0; s < nsg; ++s) {
+                tot += part[s*nr0 + tiisg];
+            }
+            dst_f32[first_row + tiisg] = tot;
+        }
+
+        return;
+    }
+
+    for (short row = 0; row < nr0 && first_row + row < ne0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = tot;
+        }
+    }
+}
+
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
         args_t args,
@@ -1540,7 +1575,12 @@ void kernel_mul_mv_q4_K_f32_impl(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * NSG + sgitg) * nr0;
+    // split-K: all simdgroups share the threadgroup's rows, simdgroup s takes block groups s, s + NSG, ...
+    const bool  ks     = FC_mul_mv_ksplit;
+    const short ib0    = ks ? 4*sgitg : 0;
+    const short ibstep = ks ? 4*NSG   : 4;
+
+    const int first_row = ks ? r0 * nr0 : (r0 * NSG + sgitg) * nr0;
 
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
@@ -1556,12 +1596,12 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     float sumf[nr0]={0.f};
 
-    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+    device const float * y4 = y + (ix + ib0) * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    for (int ib = ix + ib0; ib < nb; ib += ibstep) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
         for (short i = 0; i < 8; ++i) {
@@ -1608,17 +1648,12 @@ void kernel_mul_mv_q4_K_f32_impl(
             dh += args.nb01/2;
         }
 
-        y4 += 4 * QK_K;
+        y4 += ibstep * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
 
-    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
-        if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
-        }
-    }
+    mul_mv_store_rows<nr0>(sumf, ks, NSG, (threadgroup float *) shmem, dst_f32, first_row, args.ne0, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q4_K_f32")]]
@@ -1627,11 +1662,12 @@ kernel void kernel_mul_mv_q4_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -1749,36 +1785,7 @@ void kernel_mul_mv_q5_K_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    if (ks) {
-        // each simdgroup's partial row sums -> threadgroup memory -> simdgroup 0 adds them up
-        threadgroup float * part = (threadgroup float *) shmem;
-
-        for (int row = 0; row < nr0; ++row) {
-            const float tot = simd_sum(sumf[row]);
-            if (tiisg == 0) {
-                part[sgitg*nr0 + row] = tot;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sgitg == 0 && tiisg < nr0 && first_row + tiisg < args.ne0) {
-            float tot = 0.0f;
-            for (short s = 0; s < NSG; ++s) {
-                tot += part[s*nr0 + tiisg];
-            }
-            dst_f32[first_row + tiisg] = tot;
-        }
-
-        return;
-    }
-
-    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0) {
-            dst_f32[first_row + row] = tot;
-        }
-    }
+    mul_mv_store_rows<nr0>(sumf, ks, NSG, (threadgroup float *) shmem, dst_f32, first_row, args.ne0, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q5_K_f32")]]
@@ -1818,7 +1825,12 @@ void kernel_mul_mv_q6_K_f32_impl(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * NSG + sgitg) * nr0;
+    // split-K: all simdgroups share the threadgroup's rows, simdgroup s takes block groups s, s + NSG, ...
+    const bool  ks     = FC_mul_mv_ksplit;
+    const short ib0    = ks ? 2*sgitg : 0;
+    const short ibstep = ks ? 2*NSG   : 2;
+
+    const int first_row = ks ? r0 * nr0 : (r0 * NSG + sgitg) * nr0;
 
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
@@ -1844,7 +1856,7 @@ void kernel_mul_mv_q6_K_f32_impl(
     const short q_offset_l =  64*ip + l0;
     const short q_offset_h =  32*ip + l0;
 
-    for (int i = ix; i < nb; i += 2) {
+    for (int i = ix + ib0; i < nb; i += ibstep) {
         device const uint8_t * q1 = x[i].ql + q_offset_l;
         device const uint8_t * q2 = q1 + 32;
         device const uint8_t * qh = x[i].qh + q_offset_h;
@@ -1882,12 +1894,7 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
-        if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
-        }
-    }
+    mul_mv_store_rows<nr0>(sumf, ks, NSG, (threadgroup float *) shmem, dst_f32, first_row, args.ne0, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q6_K_f32")]]
@@ -1896,11 +1903,12 @@ kernel void kernel_mul_mv_q6_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // ======================= "True" 2-bit
@@ -2973,7 +2981,12 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
-    const int first_row = (r0 * NSG + sgitg) * NR0;
+    // split-K: all simdgroups share the threadgroup's rows, simdgroup s takes block groups s, s + NSG, ...
+    const bool  ks     = FC_mul_mv_ksplit;
+    const short ib0    = ks ? 2*sgitg : 0;
+    const short ibstep = ks ? 2*NSG   : 2;
+
+    const int first_row = ks ? r0 * NR0 : (r0 * NSG + sgitg) * NR0;
 
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
@@ -2998,7 +3011,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     float4 yl[4];
     float sumf[NR0]={0.f};
 
-    device const float * yb = y + ix * QK_K + ib * 32 + il * 8;
+    device const float * yb = y + (ix + ib0) * QK_K + ib * 32 + il * 8;
 
     uint32_t aux32[2];
     thread const uint8_t * q8 = (thread const uint8_t *)aux32;
@@ -3006,7 +3019,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     float4 qf1, qf2;
 
     // [TAG_MUL_MV_WEIRD]
-    for (int ibl = ix; ibl < nb && ibl < ns01; ibl += 2) {
+    for (int ibl = ix + ib0; ibl < nb && ibl < ns01; ibl += ibstep) {
         device const float4 * y4 = (device const float4 *)yb;
         yl[0] = y4[0];
         yl[1] = y4[4];
@@ -3039,17 +3052,13 @@ void kernel_mul_mv_iq4_xs_f32_impl(
             sumf[row] += (float)xb.d * ls * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
         }
 
-        yb += 2 * QK_K;
+        yb += ibstep * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
-        if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
-        }
-    }
+    // the partial sums go after the 32-entry lookup table
+    mul_mv_store_rows<NR0>(sumf, ks, NSG, shmem_f32 + 32, dst_f32, first_row, args.ne0, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq4_xs_f32")]]
