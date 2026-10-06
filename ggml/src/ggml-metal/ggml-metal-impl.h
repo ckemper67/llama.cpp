@@ -50,10 +50,10 @@
 // kernel_mul_mm_sb: small-batch mat-mat, 8 src0 rows per simdgroup, k step N_MM_SB_NK
 #define N_MM_SB_NSG 4
 #define N_MM_SB_NK  64
-// routing (tuned on M1 Ultra): 9..16 src1 columns always use it (the alternative is kernel_mul_mm
-// padded to 32 columns); 6..8 columns only for src0 with at least N_MM_SB_NE_MIN_6 elements and 5
-// columns with at least N_MM_SB_NE_MIN_5, below which the mat-vec kernels win; at 4 columns the
-// gain is small or negative
+// routing (tuned on M1 Ultra, see ggml_metal_op_mul_mat_use_sb): for types without a few-row MMA
+// kernel, 9..16 src1 columns always use it (the alternative is kernel_mul_mm padded to 32 columns),
+// 6..8 columns only for src0 with at least N_MM_SB_NE_MIN_6 elements and 5 columns with at least
+// N_MM_SB_NE_MIN_5, below which the mat-vec kernels win; at 4 columns the gain is small or negative
 #define N_MM_SB_NE11_MIN 5
 #define N_MM_SB_NE11_MAX 16
 #define N_MM_SB_NE_MIN_5 (1 << 25)

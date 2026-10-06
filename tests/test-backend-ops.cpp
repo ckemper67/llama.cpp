@@ -10360,6 +10360,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // size-dependent Metal routing: Q5_K at 9..16 columns from 8192 rows and at 2 columns from 4096
+    // rows, and IQ4_XS at 5..8 columns above the size thresholds (partial last row tiles)
+    for (int n : { 2, 9, 16 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 8200, n, 512, { 1, 1 }, { 1, 1 }));
+    }
+    for (int n : { 5, 6, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 8200, n, 4096, { 1, 1 }, { 1, 1 }));
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.

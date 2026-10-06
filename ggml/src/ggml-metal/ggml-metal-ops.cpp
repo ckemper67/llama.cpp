@@ -2616,27 +2616,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // small-batch mat-mat: dequantize each weight once for all (5..16) columns
+    // small-batch mat-mat (kernel_mul_mm_sb) for the cases the few-row MMA kernels above do not
+    // cover or are slower at, see ggml_metal_op_mul_mat_use_sb
     // GGML_METAL_MUL_MM_SB_DISABLE=1 falls back to the kernels below (for A/B comparisons)
     static const bool mm_sb_disabled = getenv("GGML_METAL_MUL_MM_SB_DISABLE") != nullptr;
 
-    if (!mm_sb_disabled && props_dev->has_simdgroup_mm &&
-        op->src[1]->type == GGML_TYPE_F32 && nb10 == sizeof(float) &&
-        ne00 % N_MM_SB_NK == 0 && ne11 >= N_MM_SB_NE11_MIN && ne11 <= N_MM_SB_NE11_MAX &&
-        (ne11 > 8 || (int64_t) ne00*ne01 >= (ne11 >= 6 ? N_MM_SB_NE_MIN_6 : N_MM_SB_NE_MIN_5)) &&
-        (
-         op->src[0]->type == GGML_TYPE_Q4_0   ||
-         op->src[0]->type == GGML_TYPE_Q4_1   ||
-         op->src[0]->type == GGML_TYPE_Q5_0   ||
-         op->src[0]->type == GGML_TYPE_Q5_1   ||
-         op->src[0]->type == GGML_TYPE_Q8_0   ||
-         op->src[0]->type == GGML_TYPE_Q2_K   ||
-         op->src[0]->type == GGML_TYPE_Q3_K   ||
-         op->src[0]->type == GGML_TYPE_Q4_K   ||
-         op->src[0]->type == GGML_TYPE_Q5_K   ||
-         op->src[0]->type == GGML_TYPE_Q6_K   ||
-         op->src[0]->type == GGML_TYPE_IQ4_NL ||
-         op->src[0]->type == GGML_TYPE_IQ4_XS)) {
+    if (!mm_sb_disabled && props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_sb(op)) {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mm_sb(lib, op);
 
         ggml_metal_kargs_mul_mm args = {

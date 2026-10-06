@@ -1,5 +1,6 @@
 #include "ggml-metal-common.h"
 #include "ggml-metal-fusion.h"
+#include "ggml-metal-impl.h"
 
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -115,9 +116,48 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
+bool ggml_metal_op_mul_mat_use_sb(const struct ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne11 = src1->ne[1];
+
+    if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || ne00 % N_MM_SB_NK != 0 ||
+        ne11 < N_MM_SB_NE11_MIN || ne11 > N_MM_SB_NE11_MAX) {
+        return false;
+    }
+
+    switch (src0->type) {
+        // types without a few-row MMA kernel
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return ne11 > 8 || ne00*ne01 >= (ne11 >= 6 ? N_MM_SB_NE_MIN_6 : N_MM_SB_NE_MIN_5);
+        // the few-row MMA Q5_K kernel for 9..16 rows is ~2x slower than kernel_mul_mm_sb from
+        // 8192 rows on M1 Ultra (e.g. 17408 x 5120: 820-852 us vs 406-412 us)
+        case GGML_TYPE_Q5_K:
+            return ne11 > 8 && ne01 >= 8192;
+        default:
+            return false;
+    }
+}
+
 bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
+
+    if (ggml_metal_op_mul_mat_use_sb(op)) {
+        return false;
+    }
+
+    // Q5_K at 2 rows: the mat-vec kernel is faster from 4096 rows on M1 Ultra (e.g. 5120 x 17408:
+    // 206 us vs 271 us)
+    if (src0->type == GGML_TYPE_Q5_K && src1->ne[1] == 2 && src0->ne[1] >= 4096) {
+        return false;
+    }
 
     // the batch shape goes into int16 function constants
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
