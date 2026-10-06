@@ -56,6 +56,8 @@ struct ggml_metal_pipeline_with_params {
 
     bool c4;
     bool cnt;
+
+    bool ksplit; // mat-vec: the simdgroups of a threadgroup split K over the same nr0 rows
 };
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline);

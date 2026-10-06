@@ -1027,6 +1027,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const char * suffix = "";
 
     bool split = false;
+    bool ksplit = false;
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -1108,6 +1109,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
+
+                // split K over the simdgroups when there are few rows for the GPU (measured on M1 Ultra:
+                // 17408 x 5120 452 -> 552 GB/s at 4, 6144 x 5120 422 -> 465 GB/s at 2; wide matrices lose)
+                // GGML_METAL_MV_KSPLIT=<n> forces n simdgroups (0 or 1 = off) for A/B runs
+                static const int ks_env = getenv("GGML_METAL_MV_KSPLIT") ? atoi(getenv("GGML_METAL_MV_KSPLIT")) : -1;
+                const int ks = ks_env >= 0 ? ks_env : (ne01 > 8192 ? 0 : (ne00 >= 2*ne01 ? 4 : 2));
+                if (ks > 1) {
+                    ksplit = true;
+                    nsg    = ks;
+                }
+                smem = nsg*nr0*sizeof(float);
             } break;
         case GGML_TYPE_Q6_K:
             {
@@ -1225,7 +1237,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_ksplit=%d", base, nsg, ne12, r2, r3, split, ksplit);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1236,6 +1248,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
         ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, ksplit,         FC_MUL_MV + 6);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1246,6 +1259,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
+    res.ksplit = ksplit;
 
     return res;
 }

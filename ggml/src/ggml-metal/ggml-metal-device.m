@@ -710,6 +710,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.ksplit   =*/ false,
     };
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
@@ -728,6 +729,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.ksplit   =*/ false,
     };
 
     [lib->lock lock];
