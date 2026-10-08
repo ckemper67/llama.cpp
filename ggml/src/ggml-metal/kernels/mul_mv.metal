@@ -1706,8 +1706,6 @@ void kernel_mul_mv_q5_K_f32_impl(
 
     float sumf[nr0]={0.f};
 
-    float yl[16], yh[16];
-
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
@@ -1721,10 +1719,13 @@ void kernel_mul_mv_q5_K_f32_impl(
     const short q_offset = 32*iq + l0;
     const short y_offset = 64*iq + l0;
 
-    const uint8_t hm1 = 1u << (2*iq);
-    const uint8_t hm2 = hm1 << 1;
-    const uint8_t hm3 = hm1 << 4;
-    const uint8_t hm4 = hm2 << 4;
+    // a thread reads 8 bytes of qs in each of the chunks iq and iq + 2: their low and high nibbles are the
+    // 4 sub-blocks s = 0..3 it handles. their 5th bits are bits 2*iq, 2*iq + 1, 2*iq + 4, 2*iq + 5 of qh;
+    // these shifts move them to bit 4 of each byte, next to the nibble
+    const uint sl0 = 4 - 2*iq;
+    const uint sl1 = 3 - 2*iq;
+    const uint sr2 = 2*iq;
+    const uint sr3 = 2*iq + 1;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -1732,50 +1733,76 @@ void kernel_mul_mv_q5_K_f32_impl(
     device const float * y1 = yy + (ix + ib0)*QK_K + y_offset;
 
     for (int i = ix + ib0; i < nb; i += ibstep) {
-        device const uint8_t * q1 = x[i].qs + q_offset;
-        device const uint8_t * qh = x[i].qh + l0;
-        device const half * dh = &x[i].d;
-        device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
+        device const uint     * q1 = (device const uint *) (x[i].qs + q_offset);
+        device const uint     * qh = (device const uint *) (x[i].qh + l0);
+        device const half     * dh = &x[i].d;
+        device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
 
-        device const float * y2 = y1 + 128;
+        // y of sub-block s, in fp32 for the sums that multiply the mins
+        float yf[4][8];
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (short l = 0; l < 8; ++l) {
-            yl[l+0] = y1[l+ 0]; sumy[0] += yl[l+0];
-            yl[l+8] = y1[l+32]; sumy[1] += yl[l+8];
-            yh[l+0] = y2[l+ 0]; sumy[2] += yh[l+0];
-            yh[l+8] = y2[l+32]; sumy[3] += yh[l+8];
+        float  amax = 0.f;
+        FOR_UNROLL (short l = 0; l < 8; ++l) {
+            yf[0][l] = y1[l +   0];
+            yf[1][l] = y1[l +  32];
+            yf[2][l] = y1[l + 128];
+            yf[3][l] = y1[l + 160];
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                sumy[s] += yf[s][l];
+                amax = max(amax, fabs(yf[s][l]));
+            }
         }
 
-        for (short row = 0; row < nr0; ++row) {
-            device const uint8_t * q2 = q1 + 64;
+        // the dot products run in fp16 on y scaled to |y| <= 1, so the partial sums (at most 8 products of
+        // a 5-bit value) cannot overflow; the scale is applied back in fp32. yp[s][2*w + p] pairs bytes p and
+        // p + 2 of the 32-bit qs word w, the order in which the values are unpacked below
+        const float ainv = amax > 0.f ? 1.f/amax : 0.f;
+        half2 yp[4][4];
+        FOR_UNROLL (short s = 0; s < 4; ++s) {
+            FOR_UNROLL (short w = 0; w < 2; ++w) {
+                yp[s][2*w + 0] = half2(float2(yf[s][4*w + 0], yf[s][4*w + 2]) * ainv);
+                yp[s][2*w + 1] = half2(float2(yf[s][4*w + 1], yf[s][4*w + 3]) * ainv);
+            }
+        }
 
+        // unrolling the rows raises the register count and lowers occupancy
+#pragma clang loop unroll(disable)
+        for (short row = 0; row < nr0; ++row) {
             sc16[0] = a[0] & kmask1;
             sc16[1] = a[2] & kmask1;
             sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
             sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
 
-            float4 acc1 = {0.f};
-            float4 acc2 = {0.f};
-            FOR_UNROLL (short l = 0; l < 8; ++l) {
-                uint8_t h = qh[l];
-                acc1[0] += yl[l+0] * (q1[l] & 0x0F);
-                acc1[1] += yl[l+8] * (q1[l] & 0xF0);
-                acc1[2] += yh[l+0] * (q2[l] & 0x0F);
-                acc1[3] += yh[l+8] * (q2[l] & 0xF0);
-                acc2[0] += h & hm1 ? yl[l+0] : 0.f;
-                acc2[1] += h & hm2 ? yl[l+8] : 0.f;
-                acc2[2] += h & hm3 ? yh[l+0] : 0.f;
-                acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+            half2 acc[4] = { half2(0.h), half2(0.h), half2(0.h), half2(0.h) };
+            FOR_UNROLL (short w = 0; w < 2; ++w) {
+                const uint h  = qh[w];
+                const uint qa = q1[w];
+                const uint qb = q1[w + 16];
+
+                // four 5-bit values per word: the 5th bits are merged in 4 values at a time
+                uint v[4];
+                v[0] = ( qa       & 0x0F0F0F0F) | ((h << sl0) & 0x10101010);
+                v[1] = ((qa >> 4) & 0x0F0F0F0F) | ((h << sl1) & 0x10101010);
+                v[2] = ( qb       & 0x0F0F0F0F) | ((h >> sr2) & 0x10101010);
+                v[3] = ((qb >> 4) & 0x0F0F0F0F) | ((h >> sr3) & 0x10101010);
+
+                FOR_UNROLL (short s = 0; s < 4; ++s) {
+                    // a value in the low bits of a half with exponent 10 is 1024 + value exactly: no convert
+                    const half2 q02 = as_type<half2>(( v[s]       & 0x001F001Fu) | 0x64006400u) - half2(1024.h);
+                    const half2 q13 = as_type<half2>(((v[s] >> 8) & 0x001F001Fu) | 0x64006400u) - half2(1024.h);
+                    acc[s] = fma(yp[s][2*w + 0], q02, acc[s]);
+                    acc[s] = fma(yp[s][2*w + 1], q13, acc[s]);
+                }
             }
 
-            sumf[row] += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
-                                  sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
-                                  sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
-                                  sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+            const float4 af = amax * float4(float(acc[0].x) + float(acc[0].y), float(acc[1].x) + float(acc[1].y),
+                                            float(acc[2].x) + float(acc[2].y), float(acc[3].x) + float(acc[3].y));
+
+            sumf[row] += dh[0] * (sc8[0] * af[0] + sc8[1] * af[1] + sc8[4] * af[2] + sc8[5] * af[3]) -
                          dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-            q1 += args.nb01;
-            qh += args.nb01;
+            q1 += args.nb01/4;
+            qh += args.nb01/4;
             dh += args.nb01/2;
             a  += args.nb01/2;
         }
