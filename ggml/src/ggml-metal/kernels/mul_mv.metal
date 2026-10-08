@@ -1730,6 +1730,8 @@ void kernel_mul_mv_q5_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
+    float yl[16], yh[16];
+
     device const float * y1 = yy + (ix + ib0)*QK_K + y_offset;
 
     for (int i = ix + ib0; i < nb; i += ibstep) {
@@ -1738,67 +1740,45 @@ void kernel_mul_mv_q5_K_f32_impl(
         device const half     * dh = &x[i].d;
         device const uint16_t * a  = (device const uint16_t *)x[i].scales + iq;
 
-        // y of sub-block s, in fp32 for the sums that multiply the mins
-        float yf[4][8];
+        // each value is taken in place in its byte k of a 32-bit word, i.e. times 256^k: y carries 1/256^k
+        device const float * y2 = y1 + 128;
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        float  amax = 0.f;
         FOR_UNROLL (short l = 0; l < 8; ++l) {
-            yf[0][l] = y1[l +   0];
-            yf[1][l] = y1[l +  32];
-            yf[2][l] = y1[l + 128];
-            yf[3][l] = y1[l + 160];
-            FOR_UNROLL (short s = 0; s < 4; ++s) {
-                sumy[s] += yf[s][l];
-                amax = max(amax, fabs(yf[s][l]));
-            }
+            const float sk = l%4 == 0 ? 1.f : l%4 == 1 ? 1.f/256.f : l%4 == 2 ? 1.f/65536.f : 1.f/16777216.f;
+            yl[l+0] = y1[l+ 0]; sumy[0] += yl[l+0]; yl[l+0] *= sk;
+            yl[l+8] = y1[l+32]; sumy[1] += yl[l+8]; yl[l+8] *= sk;
+            yh[l+0] = y2[l+ 0]; sumy[2] += yh[l+0]; yh[l+0] *= sk;
+            yh[l+8] = y2[l+32]; sumy[3] += yh[l+8]; yh[l+8] *= sk;
         }
 
-        // the dot products run in fp16 on y scaled to |y| <= 1, so the partial sums (at most 8 products of
-        // a 5-bit value) cannot overflow; the scale is applied back in fp32. yp[s][2*w + p] pairs bytes p and
-        // p + 2 of the 32-bit qs word w, the order in which the values are unpacked below
-        const float ainv = amax > 0.f ? 1.f/amax : 0.f;
-        half2 yp[4][4];
-        FOR_UNROLL (short s = 0; s < 4; ++s) {
-            FOR_UNROLL (short w = 0; w < 2; ++w) {
-                yp[s][2*w + 0] = half2(float2(yf[s][4*w + 0], yf[s][4*w + 2]) * ainv);
-                yp[s][2*w + 1] = half2(float2(yf[s][4*w + 1], yf[s][4*w + 3]) * ainv);
-            }
-        }
-
-        // unrolling the rows raises the register count and lowers occupancy
-#pragma clang loop unroll(disable)
         for (short row = 0; row < nr0; ++row) {
             sc16[0] = a[0] & kmask1;
             sc16[1] = a[2] & kmask1;
             sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
             sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
 
-            half2 acc[4] = { half2(0.h), half2(0.h), half2(0.h), half2(0.h) };
+            float4 acc = {0.f};
             FOR_UNROLL (short w = 0; w < 2; ++w) {
                 const uint h  = qh[w];
                 const uint qa = q1[w];
                 const uint qb = q1[w + 16];
 
                 // four 5-bit values per word: the 5th bits are merged in 4 values at a time
-                uint v[4];
-                v[0] = ( qa       & 0x0F0F0F0F) | ((h << sl0) & 0x10101010);
-                v[1] = ((qa >> 4) & 0x0F0F0F0F) | ((h << sl1) & 0x10101010);
-                v[2] = ( qb       & 0x0F0F0F0F) | ((h >> sr2) & 0x10101010);
-                v[3] = ((qb >> 4) & 0x0F0F0F0F) | ((h >> sr3) & 0x10101010);
+                const uint v0 = ( qa       & 0x0F0F0F0F) | ((h << sl0) & 0x10101010);
+                const uint v1 = ((qa >> 4) & 0x0F0F0F0F) | ((h << sl1) & 0x10101010);
+                const uint v2 = ( qb       & 0x0F0F0F0F) | ((h >> sr2) & 0x10101010);
+                const uint v3 = ((qb >> 4) & 0x0F0F0F0F) | ((h >> sr3) & 0x10101010);
 
-                FOR_UNROLL (short s = 0; s < 4; ++s) {
-                    // a value in the low bits of a half with exponent 10 is 1024 + value exactly: no convert
-                    const half2 q02 = as_type<half2>(( v[s]       & 0x001F001Fu) | 0x64006400u) - half2(1024.h);
-                    const half2 q13 = as_type<half2>(((v[s] >> 8) & 0x001F001Fu) | 0x64006400u) - half2(1024.h);
-                    acc[s] = fma(yp[s][2*w + 0], q02, acc[s]);
-                    acc[s] = fma(yp[s][2*w + 1], q13, acc[s]);
+                FOR_UNROLL (short k = 0; k < 4; ++k) {
+                    const uint m = 0xFFu << (8*k);
+                    acc[0] += yl[4*w + k + 0] * float(v0 & m);
+                    acc[1] += yl[4*w + k + 8] * float(v1 & m);
+                    acc[2] += yh[4*w + k + 0] * float(v2 & m);
+                    acc[3] += yh[4*w + k + 8] * float(v3 & m);
                 }
             }
 
-            const float4 af = amax * float4(float(acc[0].x) + float(acc[0].y), float(acc[1].x) + float(acc[1].y),
-                                            float(acc[2].x) + float(acc[2].y), float(acc[3].x) + float(acc[3].y));
-
-            sumf[row] += dh[0] * (sc8[0] * af[0] + sc8[1] * af[1] + sc8[4] * af[2] + sc8[5] * af[3]) -
+            sumf[row] += dh[0] * (sc8[0] * acc[0] + sc8[1] * acc[1] + sc8[4] * acc[2] + sc8[5] * acc[3]) -
                          dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
             q1 += args.nb01/4;

@@ -1011,9 +1011,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_sb(ggml_m
 // split-K mat-vec (FC_mul_mv_ksplit): simdgroups per threadgroup that share its rows and split K, or 0
 // for one simdgroup per row group. few rows leave the GPU underfed, so they get split. per type, from
 // llama-roofline replays of a dense 27B on M1 Ultra:
-//   q4_K:       split up to 8192 rows, wide matrices lose
-//   q5_K:       never: its fp16 dot kernel has the registers to keep enough simdgroups resident
-//               (end to end 27.30 -> 27.50 t/s against splitting up to 8192 rows)
+//   q4_K, q5_K: split up to 8192 rows (q5_K 17408 x 5120 452 -> 552 GB/s at 4, 6144 x 5120 422 -> 460 at 2),
+//               wide matrices lose
 //   iq4_xs:     split always (5120 x 17408 543 -> 563 GB/s at 2, 17408 x 5120 502 -> 540 at 4)
 //   q6_K:       2 always (17408 x 5120 543 -> 587 GB/s, 6144 x 5120 540 -> 569)
 // GGML_METAL_MV_KSPLIT=<n> forces n simdgroups (0 or 1 = off) for A/B runs
@@ -1024,7 +1023,8 @@ static int ggml_metal_mul_mv_ksplit(ggml_type type, int64_t ne00, int64_t ne01) 
     }
     const int by_aspect = ne00 >= 2*ne01 ? 4 : 2;
     switch (type) {
-        case GGML_TYPE_Q4_K:   return ne01 > 8192 ? 0 : by_aspect;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:   return ne01 > 8192 ? 0 : by_aspect;
         case GGML_TYPE_IQ4_XS: return by_aspect;
         case GGML_TYPE_Q6_K:   return 2;
         default:               return 0;
