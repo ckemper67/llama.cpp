@@ -32,7 +32,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 //
 
 // f16 copy of a large f32 src1 for the mat-mat kernel
-size_t ggml_metal_op_mul_mat_extra_src1(const struct ggml_tensor * op);
+size_t ggml_metal_op_mul_mat_extra_src1(const struct ggml_tensor * op, const struct ggml_metal_device_props * props);
 
 // tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);

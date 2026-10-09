@@ -56,6 +56,11 @@ bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_sim
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
 bool ggml_metal_op_mul_mat_use_sb     (const struct ggml_tensor * op); // kernel_mul_mm_sb (small batch)
+
+// kernel_mul_mm reads an f16 copy of a large f32 src1 (shape and device conditions only, so the extra
+// memory for the copy can be sized before the tensors are allocated)
+struct ggml_metal_device_props;
+bool ggml_metal_op_mul_mat_use_src1_f16(const struct ggml_tensor * op, const struct ggml_metal_device_props * props);
 bool ggml_metal_op_mul_mat_use_mma    (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op); // graph structure only
 

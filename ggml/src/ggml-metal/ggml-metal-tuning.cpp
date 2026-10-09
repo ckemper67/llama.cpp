@@ -1,6 +1,8 @@
 #include "ggml-metal-tuning.h"
+#include "ggml-metal-device.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 
@@ -1167,6 +1169,32 @@ fa_vec_cfg_t fa_vec_pick(int gpu_family, int dtype, int dk, int dv, int64_t ne11
     }
 
     return baseline;
+}
+
+struct mul_mm_src1_f16_entry_t {
+    int    device_id;
+    size_t min;
+};
+
+// tuned with llama-bench prefill (pp32 .. pp512) over GGML_METAL_MUL_MM_SRC1_F16_MIN
+// M1 Ultra, gemma-4-31B pp512: off 200.7, 24 MiB 227.5, 4 MiB 231.4 t/s; 0 costs 3.5% at pp32
+static const mul_mm_src1_f16_entry_t mul_mm_src1_f16_table[] = {
+    { GGML_METAL_DEVICE_M1_ULTRA, 4u*1024*1024 },
+};
+
+size_t mul_mm_src1_f16_min(int device_id) {
+    static const char * env = getenv("GGML_METAL_MUL_MM_SRC1_F16_MIN");
+    if (env) {
+        return (size_t) strtoull(env, nullptr, 10);
+    }
+
+    for (const auto & e : mul_mm_src1_f16_table) {
+        if (e.device_id == device_id) {
+            return e.min;
+        }
+    }
+
+    return MUL_MM_SRC1_F16_MIN_DEFAULT;
 }
 
 }  // namespace ggml_metal_tuning

@@ -2587,32 +2587,10 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// the f32 src1 reads of kernel_mul_mm slow down sharply once src1 grows past ~24 MB (M1 Ultra: between
-// 25 and 34 MB at 512 rows), e.g. the gemma-4-31B ffn_down at 512 tokens (K = 21504) runs at 9.2 TFLOPS
-// with f32 src1 and 14.0 with f16. above this size the mat-mat kernel reads an f16 copy of src1 instead;
-// the result is the same, since the f32 kernel rounds src1 to f16 when it stages it in threadgroup memory
-// GGML_METAL_MUL_MM_SRC1_F16_DISABLE=1 turns this off (for A/B comparisons)
-static constexpr size_t GGML_METAL_MUL_MM_SRC1_F16_MIN = 24u*1024*1024;
-
-// shape conditions only, so that the extra memory can be sized before the tensors are allocated
-static bool ggml_metal_op_mul_mat_src1_f16(const ggml_tensor * op) {
-    static const bool disabled = getenv("GGML_METAL_MUL_MM_SRC1_F16_DISABLE") != nullptr;
-
-    const ggml_tensor * src0 = op->src[0];
-    const ggml_tensor * src1 = op->src[1];
-
-    // bf16 src0 stages src1 as bfloat, there is no kernel_mul_mm_bf16_f16
-    return !disabled &&
-        src1->type == GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16 &&
-        src1->ne[2] == 1 && src1->ne[3] == 1 &&
-        src1->ne[0] % 4 == 0 && src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 &&
-        ggml_nbytes(src1) >= GGML_METAL_MUL_MM_SRC1_F16_MIN;
-}
-
-size_t ggml_metal_op_mul_mat_extra_src1(const ggml_tensor * op) {
+size_t ggml_metal_op_mul_mat_extra_src1(const ggml_tensor * op, const ggml_metal_device_props * props) {
     assert(op->op == GGML_OP_MUL_MAT);
 
-    if (!ggml_metal_op_mul_mat_src1_f16(op)) {
+    if (!ggml_metal_op_mul_mat_use_src1_f16(op, props)) {
         return 0;
     }
 
@@ -2806,9 +2784,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         uint64_t nb12_mm = nb12;
         uint64_t nb13_mm = nb13;
 
-        // large f32 src1: convert it to f16 into the extra memory of dst first, see ggml_metal_op_mul_mat_src1_f16
-        // (not with the tensor API kernel, which reads src1 from device memory without rounding it to f16)
-        const bool src1_f16 = !props_dev->has_tensor && ggml_metal_op_mul_mat_src1_f16(op) && bid_src1.offs % 16 == 0;
+        // large f32 src1: convert it to f16 into the extra memory of dst first, see ggml_metal_op_mul_mat_use_src1_f16
+        const bool src1_f16 = ggml_metal_op_mul_mat_use_src1_f16(op, props_dev) && bid_src1.offs % 16 == 0;
 
         if (src1_f16) {
             ggml_metal_buffer_id bid_tmp = ggml_metal_get_buffer_id(op);

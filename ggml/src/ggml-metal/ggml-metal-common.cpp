@@ -1,4 +1,6 @@
 #include "ggml-metal-common.h"
+#include "ggml-metal-device.h"
+#include "ggml-metal-tuning.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-impl.h"
 
@@ -40,6 +42,27 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
            has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
+}
+
+// the f32 src1 reads of kernel_mul_mm slow down sharply once src1 outgrows the system-level cache
+// (M1 Ultra: between 25 and 34 MB at 512 rows), e.g. the gemma-4-31B ffn_down at 512 tokens (K = 21504)
+// runs at 9.2 TFLOPS with f32 src1 and 14.0 with f16, and below that f16 src1 is still a few percent
+// faster. above a per-chip size (ggml_metal_tuning::mul_mm_src1_f16_min) the mat-mat kernel reads an
+// f16 copy of src1 instead; the result is the same, since the f32 kernel rounds src1 to f16 when it
+// stages it in threadgroup memory. not with the tensor API kernel, which reads src1 without rounding it
+// GGML_METAL_MUL_MM_SRC1_F16_DISABLE=1 turns this off (for A/B comparisons)
+bool ggml_metal_op_mul_mat_use_src1_f16(const struct ggml_tensor * op, const struct ggml_metal_device_props * props) {
+    static const bool disabled = getenv("GGML_METAL_MUL_MM_SRC1_F16_DISABLE") != nullptr;
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    // bf16 src0 stages src1 as bfloat, there is no kernel_mul_mm_bf16_f16
+    return !disabled && !props->has_tensor &&
+        src1->type == GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16 &&
+        src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->ne[0] % 4 == 0 && src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 &&
+        ggml_nbytes(src1) >= ggml_metal_tuning::mul_mm_src1_f16_min(props->device_id);
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

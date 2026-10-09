@@ -10376,9 +10376,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
 
-    // The Metal backend converts an f32 src1 of 24 MiB or more to f16 before the mat-mat kernel
-    // (GGML_METAL_MUL_MM_SRC1_F16_MIN in ggml-metal-ops.cpp). Cover it with a row count that is not a
-    // multiple of the 32-row tile and with strided src1 rows (k_v > k).
+    // The Metal backend converts a large f32 src1 to f16 before the mat-mat kernel, from a per-chip
+    // size of at most 24 MiB (ggml_metal_tuning::mul_mm_src1_f16_min). Cover it with a row count that
+    // is not a multiple of the 32-row tile and with strided src1 rows (k_v > k).
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 512, 16384, { 1, 1 }, { 1, 1 }));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 72, 300, 21504, { 1, 1 }, { 1, 1 }));

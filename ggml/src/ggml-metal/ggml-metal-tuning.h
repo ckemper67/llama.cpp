@@ -72,4 +72,14 @@ fa_vec_cfg_t fa_vec_baseline_cfg(int dk, int dv);
 // Keyed by Apple GPU family; an untuned family matches no row and gets the baseline.
 fa_vec_cfg_t fa_vec_pick(int gpu_family, int dtype, int dk, int dv, int64_t ne11, int64_t ne01);
 
+// Size of an f32 src1 from which the mat-mat kernel reads an f16 copy of it instead, see
+// ggml_metal_op_mul_mat_use_src1_f16. The f16 reads are a few percent faster at any size, which pays
+// for the copy above a few MB, and the f32 reads slow down sharply once src1 outgrows the system-level
+// cache. Cache sizes differ between chips of one GPU family (M1: 8 MB, M1 Ultra: 96 MB), so this is
+// keyed by chip (enum ggml_metal_device_id); unmeasured chips get the conservative default, which
+// only catches the cliff. GGML_METAL_MUL_MM_SRC1_F16_MIN=<bytes> overrides it (for tuning).
+constexpr size_t MUL_MM_SRC1_F16_MIN_DEFAULT = 24u*1024*1024;
+
+size_t mul_mm_src1_f16_min(int device_id);
+
 }  // namespace ggml_metal_tuning

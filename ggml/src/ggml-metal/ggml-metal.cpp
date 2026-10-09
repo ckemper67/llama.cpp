@@ -224,7 +224,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
     switch (tensor->op) {
         case GGML_OP_MUL_MAT:
             {
-                res += ggml_metal_op_mul_mat_extra_src1(tensor);
+                res += ggml_metal_op_mul_mat_extra_src1(tensor, ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context));
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
