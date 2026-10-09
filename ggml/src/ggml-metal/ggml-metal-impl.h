@@ -529,6 +529,11 @@ typedef struct {
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {
+    int32_t  ne10;
+    uint64_t nb11;
+} ggml_metal_kargs_mul_mm_cvt;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

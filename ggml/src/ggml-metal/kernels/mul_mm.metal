@@ -563,6 +563,23 @@ kernel void kernel_mul_mm_id_map0(
     tpe_u32[ide] = n_all;
 }
 
+// f32 -> f16 copy of src1 for kernel_mul_mm_<type>_f16, one row per threadgroup into a dense [ne10, ne11] tensor
+// the conversion matches the one kernel_mul_mm_<type>_f32 does when it stages src1 in threadgroup memory
+kernel void kernel_mul_mm_cvt_f32_f16(
+        constant ggml_metal_kargs_mul_mm_cvt & args,
+        device const char * src1,
+        device       char * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    device const float4 * x = (device const float4 *) (src1 + tgpig*args.nb11);
+    device       half4  * y = (device       half4  *) (dst  + tgpig*args.ne10*sizeof(half));
+
+    for (int i = tiitg; i < args.ne10/4; i += ntg) {
+        y[i] = (half4) x[i];
+    }
+}
+
 kernel void kernel_mul_mm_id_amax_part_f32(
         constant ggml_metal_kargs_mul_mm_id_amax & args,
         device   const char * src1,
