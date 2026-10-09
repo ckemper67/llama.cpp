@@ -321,7 +321,8 @@ void kernel_flash_attn_ext_impl(
                         q8x8_t mq[2];
 
                         // note: too much unroll can tank the performance for large heads
-                        #pragma unroll (MIN(DK8/2, 4*NSG))
+                        //       (M1 Ultra, DK = 512 with 8 simdgroups: fully unrolled, i.e. 32, is 4x slower than 16)
+                        #pragma unroll (MIN(DK8/2, 16))
                         for (short i = 0; i < DK8/2; ++i) {
                             simdgroup_barrier(mem_flags::mem_none);
 
